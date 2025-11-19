@@ -33,7 +33,7 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU()
-        self.c_porj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -76,7 +76,7 @@ class CrossSelfAttention(nn.Module):
         qkv = self.c_attn(x)
         # 用一个大w计算,速度更快,然后再分割
         # B, T不变,liner做的仅在最后一维操作,因此在最后一维分割即可
-        q, k, v = qkv.split(3, dim=-1)
+        q, k, v = qkv.split(self.n_embd, dim=-1)
         # multi head
         q = q.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
@@ -120,7 +120,7 @@ class GPT(nn.Module):
         # 模仿transformers中的结构,用nn.ModuleDict构建模型块,forward时再调用即可
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
-            wpe=nn.Embedding(config.n_embd, config.n_embd),
+            wpe=nn.Embedding(config.block_size, config.n_embd),
             # ModuleList可以按数字访问,和play.ipynb中保持一致
             h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             # gpt2论文指出最后的输出前要加layernorm
@@ -129,7 +129,7 @@ class GPT(nn.Module):
         # 输出头,直接用Liner
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     @classmethod
-    def from_pretrain(cls,model_type):
+    def from_pretrained(cls,model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
@@ -171,16 +171,20 @@ class GPT(nn.Module):
             # 需要转置处理的特殊weight
             if any(k.endswith(w) for w in transposed):
                 # 确保转置后的源权重形状与目标权重形状匹配
-                assert sd_hf[k].shape[::-1] == sd[k].shape
+                print(k, sd_hf[k].shape)
+                print(k, sd[k].shape)
+                assert sd_hf[k].shape[::-1] == sd[k].shape,f"{sd_hf[k].shape[::-1]} != {sd[k].shape},{k}"
                 with torch.no_grad():
                     # # 3. 将源权重转置后，复制到目标模型的参数中
                     sd[k].copy_(sd_hf[k].t())
             else:
                 # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
+                assert sd_hf[k].shape == sd[k].shape, f"{sd_hf[k].shape} != {sd[k].shape},{k}"
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
 
-model=GPT.from_pretrain('gpt2')
+
+
+model=GPT.from_pretrained('gpt2')
 print("ok")
