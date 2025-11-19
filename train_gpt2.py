@@ -57,9 +57,11 @@ class CrossSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
+        # set signal wo scale
+        self.c_proj.NANOGPT_SCALE_INIT=1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         # 它的核心作用是创建一个 “看不见未来” 的挡板，专业上称为因果掩码（Causal Mask）
         # torch.tril:下三角,会把矩阵中上三角部分的元素全部变成 0，只保留对角线和下三角部分的 1
@@ -130,32 +132,51 @@ class GPT(nn.Module):
         # 输出头,直接用Liner
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx,target= None):
+        # 根据gpt2论文,wte和lm_head的权重是绑定的,
+        # 因此这里将二者直接使用指针引用,从而实现参数共享
+        # nn.Linear与nn.embedding 在权重上是转置关系,
+        # 搜一下相关资料就知道为什么了(token 理解为one-hot,结果计算embedding矩阵的一行,因此和liner运算是转置关系
+        self.transformer.wte.weight = self.lm_head.weight
+
+
+
+    def _init_weights(self,module):
+    # 根据代码提示,liner和embed用的标准差0.02的正态分布
+    # wpe用的0.01正态分布初始化
+        if isinstance(module, nn.Linear):
+            std=0.02
+            # 残差会积累标准差,因此要在残差处进行缩放,具体看gpt2论文
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std*=(2*self.config.n_layer)**-0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def forward(self, idx, target=None):
         # b*t个token,经过了tokenizer
         B, T = idx.size()
         # 超出最大序列长度则报错
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # 位置编码,为每个位置带上自己的位置索引,然后进行pos_embed
         # device=idx.device 避免数据在不同的device上
-        pos=torch.arange(0,T, dtype=torch.long, device=idx.device)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         # emb+pos
-        pos_emb=self.transformer.wpe(pos) # (T,n_embed)
-        emb=self.transformer.wte(idx) # (B,T,n_embed)
-        x=emb+pos_emb # (B,T,n_embed)
+        pos_emb = self.transformer.wpe(pos)  # (T,n_embed)
+        emb = self.transformer.wte(idx)  # (B,T,n_embed)
+        x = emb + pos_emb  # (B,T,n_embed)
 
         for block in self.transformer.h:
-            x=block(x)
+            x = block(x)
         # gpt2论文中要求输出前加一个LayerNorm
-        x=self.transformer.ln_f(x)
-        logits=self.lm_head(x) # (B,T,vocab_size)
-        loss=None
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)  # (B,T,vocab_size)
+        loss = None
         if target is not None:
             # celoss不接受多维输入,因此需要将多维的输入拉平
-            loss=F.cross_entropy(logits.view(-1,logits.shape[-1]),target.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), target.view(-1))
 
-        return logits,loss
-
-
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -214,33 +235,60 @@ class GPT(nn.Module):
         return model
 
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B, self.T = B, T
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+        with open('input.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
+            # print(text[:1000])
+        encoding = tiktoken.get_encoding('gpt2')
+        self.tokens = encoding.encode(text)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        tokens = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x = torch.tensor(tokens[:-1]).view(B, T)
+        y = torch.tensor(tokens[1:]).view(B, T)
+        self.current_position += B * T
+        # 超界限则reset
+        if self.current_position + B * T >= len(self.tokens):
+            self.current_position = 0
+        # 按batch跳token
+        return x, y
+
 
 # Use a more general method
-device='cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # data loading
 import tiktoken
-enc=tiktoken.get_encoding("gpt2")
-with open('input.txt','r',encoding='utf-8') as f:
-    text=f.read()
+
+enc = tiktoken.get_encoding("gpt2")
+with open('input.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
     # print(text[:1000])
-encoding=tiktoken.get_encoding('gpt2')
-token=encoding.encode(text[:1000])
-B,T=4,32 #using for debug
+encoding = tiktoken.get_encoding('gpt2')
+token = encoding.encode(text[:1000])
+B, T = 4, 32  # using for debug
 # 初始化,用buf不断滑动窗口得到输入和输出来求loss
 
 
-num_return_sequences=5
-max_length=30
+num_return_sequences = 5
+max_length = 30
 # model = GPT.from_pretrained('gpt2')
 # torch已经帮我们做好了随机初始化
-model=GPT(GPTConfig())
+model = GPT(GPTConfig())
 print("ok")
-
+model.to(device)
 # model.eval()
 
 # 随机初始化的loss=10.9650
-p_token=1/50257
+p_token = 1 / 50257
 # 交叉熵计算:-ln P
 print(-math.log(p_token))
 # 和随机预测的loss很接近
@@ -251,52 +299,55 @@ print(-math.log(p_token))
 # optim
 optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 # 循环训练
-for i in range(50):
+data = DataLoaderLite(B, T)
+for i in range(2640):
     optim.zero_grad()
-    buf = torch.tensor(token[i:B * T + 1+i], device=device)
-    x = buf[:-1].view(B, T)
-    y = buf[1:].view(B, T)
-    model.to(device)
+    x, y = data.next_batch()
+    # 仅在读取时调用至GPU,减少显存消耗
+    x, y = x.to(device), y.to(device)
     logits, loss = model(x, y)
-    print(f"step{i}",'loss=',loss.item())
+    print(f"step{i}", 'loss=', loss.item())
     loss.backward()
     optim.step()
 
 # 下面是之前生成的代码,这里计算loss时忽略
-import sys;sys.exit(0)
+import sys;
+
+sys.exit(0)
 
 # tokenizer encode
 import tiktoken
-enc=tiktoken.get_encoding("gpt2")
-tokens=enc.encode("Hello, I'm a language model,")
-tokens=torch.tensor(tokens,dtype=torch.long)
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long)
 # 得到5个相同起始的输入
-tokens=tokens.unsqueeze(0).repeat(num_return_sequences)
-x=tokens.to(device)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences)
+x = tokens.to(device)
 
 # 生成
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
-while x.size(1)<max_length:
+while x.size(1) < max_length:
     with torch.no_grad():
-        logits=model(x)#(b,t,vocab_size)
+        logits = model(x)  # (b,t,vocab_size)
 
         # 取出最后一个字的词表概率用于计算
-        logits=logits[:,-1,:] #(b,vocab_size)
+        logits = logits[:, -1, :]  # (b,vocab_size)
         # 在最后一维求softmax
-        probs=F.softmax(logits,dim=-1) #(b,vocab_size)
+        probs = F.softmax(logits, dim=-1)  # (b,vocab_size)
 
         # topk,用于temp高时实现非贪心搜索
-        topk_probs,topk_indices=torch.topk(probs,k=50,dim=-1) #(b,50)
+        topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)  # (b,50)
 
         # torch.multinomial根据topk probs的概率，在50个选项里随机抽1个，概率大的词更容易被抽到；
         # idx是每行选中的位置（0~49之间），形状为(5, 1)。
-        ix=torch.multinomial(topk_probs,num_samples=1)
+        ix = torch.multinomial(topk_probs, num_samples=1)
 
         # 取出真正的token ID
-        xcol=torch.gather(topk_indices,dim=-1,index=ix) #(b,1)
+        xcol = torch.gather(topk_indices, dim=-1, index=ix)  # (b,1)
         # 将新的词拼接在原来的输入x后面
-        x=torch.cat((x,xcol),dim=1)
+        x = torch.cat((x, xcol), dim=1)
 # 输出解码结果
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
