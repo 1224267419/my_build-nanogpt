@@ -130,12 +130,13 @@ class GPT(nn.Module):
         # 输出头,直接用Liner
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+    def forward(self, idx,target= None):
         # b*t个token,经过了tokenizer
         B, T = idx.size()
         # 超出最大序列长度则报错
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # 位置编码,为每个位置带上自己的位置索引,然后进行pos_embed
+        # device=idx.device 避免数据在不同的device上
         pos=torch.arange(0,T, dtype=torch.long, device=idx.device)
         # emb+pos
         pos_emb=self.transformer.wpe(pos) # (T,n_embed)
@@ -146,8 +147,13 @@ class GPT(nn.Module):
             x=block(x)
         # gpt2论文中要求输出前加一个LayerNorm
         x=self.transformer.ln_f(x)
-        logits=self.lm_head(x)
-        return logits
+        logits=self.lm_head(x) # (B,T,vocab_size)
+        loss=None
+        if target is not None:
+            # celoss不接受多维输入,因此需要将多维的输入拉平
+            loss=F.cross_entropy(logits.view(-1,logits.shape[-1]),target.view(-1))
+
+        return logits,loss
 
 
 
@@ -209,21 +215,64 @@ class GPT(nn.Module):
 
 
 
+# Use a more general method
+device='cuda' if torch.cuda.is_available() else 'cpu'
+
+# data loading
+import tiktoken
+enc=tiktoken.get_encoding("gpt2")
+with open('input.txt','r',encoding='utf-8') as f:
+    text=f.read()
+    # print(text[:1000])
+encoding=tiktoken.get_encoding('gpt2')
+token=encoding.encode(text[:1000])
+B,T=4,32 #using for debug
+# 初始化,用buf不断滑动窗口得到输入和输出来求loss
+
+
 num_return_sequences=5
 max_length=30
-model = GPT.from_pretrained('gpt2')
+# model = GPT.from_pretrained('gpt2')
+# torch已经帮我们做好了随机初始化
+model=GPT(GPTConfig())
 print("ok")
 
-model.eval()
-model.to('cuda')
+# model.eval()
+
+# 随机初始化的loss=10.9650
+p_token=1/50257
+# 交叉熵计算:-ln P
+print(-math.log(p_token))
+# 和随机预测的loss很接近
+
+# AdamW将优化过程中使用的针对网络权重的衰减项（或者叫正则项）从loss中单独拿了出来，
+# 不参与Adam中一二阶动量的计算
+
+# optim
+optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# 循环训练
+for i in range(50):
+    optim.zero_grad()
+    buf = torch.tensor(token[i:B * T + 1+i], device=device)
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+    model.to(device)
+    logits, loss = model(x, y)
+    print(f"step{i}",'loss=',loss.item())
+    loss.backward()
+    optim.step()
+
+# 下面是之前生成的代码,这里计算loss时忽略
+import sys;sys.exit(0)
+
 # tokenizer encode
 import tiktoken
 enc=tiktoken.get_encoding("gpt2")
 tokens=enc.encode("Hello, I'm a language model,")
 tokens=torch.tensor(tokens,dtype=torch.long)
 # 得到5个相同起始的输入
-tokens=tokens.unsqueeze(0).repeat(num_return_sequences,1)
-x=tokens.to('cuda')
+tokens=tokens.unsqueeze(0).repeat(num_return_sequences)
+x=tokens.to(device)
 
 # 生成
 torch.manual_seed(42)
