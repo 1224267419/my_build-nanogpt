@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -38,7 +39,7 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
-        x = self.c_porj(x)
+        x = self.c_proj(x)
         return x
 
 
@@ -84,7 +85,7 @@ class CrossSelfAttention(nn.Module):
 
         # att=q@kT /sqrt(dim_k)
         # 对于更高维度的张量，torch.matmul 执行的是批量矩阵乘法
-        att = torch.matmul(q, k.transpose(-2, -1)) / (self.n_embd // self.n_head)
+        att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.n_embd // self.n_head)
         #  att.masked_fill -inf,使得softmax时值为0
         # self.bias[:, :, :T, :T] 取出和当前序列长度 T 匹配的掩码部分,
         # masked_fill(条件, 值)：把掩码中为 0 的位置，对应的注意力分数改成 -inf（负无穷）
@@ -128,8 +129,30 @@ class GPT(nn.Module):
         ))
         # 输出头,直接用Liner
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx):
+        # b*t个token,经过了tokenizer
+        B, T = idx.size()
+        # 超出最大序列长度则报错
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # 位置编码,为每个位置带上自己的位置索引,然后进行pos_embed
+        pos=torch.arange(0,T, dtype=torch.long, device=idx.device)
+        # emb+pos
+        pos_emb=self.transformer.wpe(pos) # (T,n_embed)
+        emb=self.transformer.wte(idx) # (B,T,n_embed)
+        x=emb+pos_emb # (B,T,n_embed)
+
+        for block in self.transformer.h:
+            x=block(x)
+        # gpt2论文中要求输出前加一个LayerNorm
+        x=self.transformer.ln_f(x)
+        logits=self.lm_head(x)
+        return logits
+
+
+
     @classmethod
-    def from_pretrained(cls,model_type):
+    def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         from transformers import GPT2LMHeadModel
@@ -137,10 +160,10 @@ class GPT(nn.Module):
         # n_layer, n_head and n_embd are determined from model_type
         # 根据你传入的model_type变量，从字典中取出对应的参数
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
         }[model_type]
         config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
@@ -150,17 +173,17 @@ class GPT(nn.Module):
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        #将除了bias的keys读取进来(bias是attention的掩码,之前讲过)
+        # 将除了bias的keys读取进来(bias是attention的掩码,之前讲过)
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  # discard this mask / buffer, not a param
 
         # init huggingface/transformers model
-        model_hf=GPT2LMHeadModel.from_pretrained(model_type)
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        #copy while ensuring all the parameters are aligned and match in names and shapes
-        sd_keys_hf=sd_hf.keys()
+        # copy while ensuring all the parameters are aligned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
         # endswith()方法用于判断字符串是否以指定的后缀结束,这里是前面提到的mask部分,由于不参与模型训练,因此忽略
-        sd_keys_hf=[k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]# ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # same, just the mask (buffer)
 
         # OpenAI的checkpoint使用的是 “Conv1D” 模块，但我们只想使用普通的
@@ -173,7 +196,7 @@ class GPT(nn.Module):
                 # 确保转置后的源权重形状与目标权重形状匹配
                 print(k, sd_hf[k].shape)
                 print(k, sd[k].shape)
-                assert sd_hf[k].shape[::-1] == sd[k].shape,f"{sd_hf[k].shape[::-1]} != {sd[k].shape},{k}"
+                assert sd_hf[k].shape[::-1] == sd[k].shape, f"{sd_hf[k].shape[::-1]} != {sd[k].shape},{k}"
                 with torch.no_grad():
                     # # 3. 将源权重转置后，复制到目标模型的参数中
                     sd[k].copy_(sd_hf[k].t())
@@ -186,5 +209,47 @@ class GPT(nn.Module):
 
 
 
-model=GPT.from_pretrained('gpt2')
+num_return_sequences=5
+max_length=30
+model = GPT.from_pretrained('gpt2')
 print("ok")
+
+model.eval()
+model.to('cuda')
+# tokenizer encode
+import tiktoken
+enc=tiktoken.get_encoding("gpt2")
+tokens=enc.encode("Hello, I'm a language model,")
+tokens=torch.tensor(tokens,dtype=torch.long)
+# 得到5个相同起始的输入
+tokens=tokens.unsqueeze(0).repeat(num_return_sequences,1)
+x=tokens.to('cuda')
+
+# 生成
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1)<max_length:
+    with torch.no_grad():
+        logits=model(x)#(b,t,vocab_size)
+
+        # 取出最后一个字的词表概率用于计算
+        logits=logits[:,-1,:] #(b,vocab_size)
+        # 在最后一维求softmax
+        probs=F.softmax(logits,dim=-1) #(b,vocab_size)
+
+        # topk,用于temp高时实现非贪心搜索
+        topk_probs,topk_indices=torch.topk(probs,k=50,dim=-1) #(b,50)
+
+        # torch.multinomial根据topk probs的概率，在50个选项里随机抽1个，概率大的词更容易被抽到；
+        # idx是每行选中的位置（0~49之间），形状为(5, 1)。
+        ix=torch.multinomial(topk_probs,num_samples=1)
+
+        # 取出真正的token ID
+        xcol=torch.gather(topk_indices,dim=-1,index=ix) #(b,1)
+        # 将新的词拼接在原来的输入x后面
+        x=torch.cat((x,xcol),dim=1)
+# 输出解码结果
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
