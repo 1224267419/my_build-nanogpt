@@ -77,6 +77,8 @@ class CrossSelfAttention(nn.Module):
         # batch size, sequence length, embedding dimensionality (n_embd)
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         B, T, C = x.size()
+
+        # 得到qkv矩阵
         qkv = self.c_attn(x)
         # 用一个大w计算,速度更快,然后再分割
         # B, T不变,liner做的仅在最后一维操作,因此在最后一维分割即可
@@ -86,16 +88,22 @@ class CrossSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
         v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
 
-        # att=q@kT /sqrt(dim_k)
-        # 对于更高维度的张量，torch.matmul 执行的是批量矩阵乘法
-        att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.n_embd // self.n_head)
-        #  att.masked_fill -inf,使得softmax时值为0
-        # self.bias[:, :, :T, :T] 取出和当前序列长度 T 匹配的掩码部分,
-        # masked_fill(条件, 值)：把掩码中为 0 的位置，对应的注意力分数改成 -inf（负无穷）
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att_score = F.softmax(att, dim=-1)
+        # #mha
+        # #att=q@kT /sqrt(dim_k)
+        # #对于更高维度的张量，torch.matmul 执行的是批量矩阵乘法
+        # att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.n_embd // self.n_head)
+        # #  att.masked_fill -inf,使得softmax时值为0
+        # # self.bias[:, :, :T, :T] 取出和当前序列长度 T 匹配的掩码部分,
+        # # masked_fill(条件, 值)：把掩码中为 0 的位置，对应的注意力分数改成 -inf（负无穷）
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # y = F.softmax(att, dim=-1)
+        # y = torch.matmul(y, v)  # (B,nh,T,T) * (B,nh,T,hs) -> (B,nh,T,hs)
 
-        y = torch.matmul(att_score, v)  # (B,nh,T,T) * (B,nh,T,hs) -> (B,nh,T,hs)
+        # FlashAttention,一行就可以调用完成
+        y=F.scaled_dot_product_attention(q, k, v,is_causal=True)
+
+
+
         # re-assemble all head outputs side by
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -295,6 +303,7 @@ print("ok")
 # 而且即使运算速度最高提升了8倍,实际运算吞吐量从6000t/s ->8000t/s 主要原因还是受内存速率影响
 torch.set_float32_matmul_precision('high')
 model.to(device)
+# model=torch.compile( model)
 # model.eval()
 
 # 随机初始化的loss=10.9650

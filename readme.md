@@ -73,3 +73,34 @@ amp中会使用fp16/32的模块见[链接](https://docs.pytorch.org/docs/stable/
 一般而言,**乘法不易受精度影响**,而指数运算影响较大,具体看链接吧
 
 `import code;code.interact(local=locals())`使用这段代码可以截断运行并保存运行状态,然后打开一个ipython**解释器**，让你可以实时查看和操作当前作用域内的变量与函数。
+
+## torch.compile
+
+ torch.compile 通过 JIT 将 PyTorch 代码编译成优化的内核，使 PyTorch 代码运行得更快
+
+win中使用triton不能直接pip,使用hf编译好的[链接](https://hf-mirror.com/madbuda/triton-windows-builds),本地pip安装即可
+
+`torch.compile(model)`就是最简单的实现,后续有更复杂的需求再实现
+
+
+
+## FlashAttention
+
+1. 标准注意力机制的核心瓶颈是 **“中间状态存储”**：计算 Softmax (QKᵀ)・V 时，会先显式计算并存储巨大的 QKᵀ 矩阵,
+2. FlashAttention 的核心突破是 **“分块计算（Tiling）”** 和 **“计算与访存的重叠（Fusion）”**，具体逻辑如下：
+   1. **分块处理 Q、K、V**：将 Q、K、V 按序列长度维度拆分为多个小块（例如每个块的大小为 [B, H, T, C]，其中 T 是块的序列长度，远小于总序列长度 L）；
+   2. **块内即时计算**：对每个小块，仅加载当前块的 Q、K 进行 QKᵀ 计算，随后**立即与块内的 V 进行矩阵乘法**，并将结果累加至最终输出，避免存储完整的 QKᵀ 矩阵；
+   3. **Softmax 分块融合**：QKᵀ 计算后，先在块内计算 Softmax 的中间结果（最大值、求和项），再与下一块的结果合并，最终得到全局 Softmax 结果，同样**无需存储完整的 Softmax 矩阵**。
+   4. FlashAttention 将内存占用从 **O(L²)** 降低至 **O(L√L)**
+
+3. FlashAttention 深度**适配了 GPU 的多级存储架构**（寄存器 → 共享内存 → 显存 → 内存），通过 “数据本地化” 减少跨层级访存的延迟：
+   1. **优先使用高速存储**：将小块 Q、K、V 加载到 GPU 的共享内存（Shared Memory，带宽远高于显存）中进行计算，避免频繁从显存读取数据；
+   2. **寄存器级计算融合**：在 GPU **核心的寄存器中直接完成 QKᵀ、Softmax、V 乘法的部分计算，减少数据在寄存器与共享内存之间的搬运**；
+   3. **避免冗余访存**：通过 “计算 - 存储重叠”，在加载下一块数据的同时，对当前块进行计算，隐藏访存延迟。
+
+compare:
+
+without flashAttention:8850 t/s
+with flashAttention :14500 t/s
+
+显然极大增加了attention的运算速率
