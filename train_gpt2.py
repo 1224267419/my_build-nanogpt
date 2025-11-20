@@ -88,7 +88,7 @@ class CrossSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
         v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
 
-        # #mha
+        
         # #att=q@kT /sqrt(dim_k)
         # #对于更高维度的张量，torch.matmul 执行的是批量矩阵乘法
         # att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.n_embd // self.n_head)

@@ -101,6 +101,14 @@ win中使用triton不能直接pip,使用hf编译好的[链接](https://hf-mirror
 compare:
 
 without flashAttention:8850 t/s
-with flashAttention :14500 t/s
+with flashAttention :15000 t/s
 
-显然极大增加了attention的运算速率
+提升了约60%的运算效率
+
+#### 使用更多2的指数次幂来提升运算速度
+
+vocab_size=50304 17425.3token/s
+vocab_size= 50257 15005.4token/s
+提升了约16%
+
+二进制转换 50257->1100010001010001,通过抹掉后面的0来进位,即50304->1100010010000000即所求
