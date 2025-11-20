@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -274,7 +275,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
     # print(text[:1000])
 encoding = tiktoken.get_encoding('gpt2')
 token = encoding.encode(text[:1000])
-B, T = 4, 32  # using for debug
+B, T = 2, 1024  # using for debug
 # 初始化,用buf不断滑动窗口得到输入和输出来求loss
 
 
@@ -284,6 +285,15 @@ max_length = 30
 # torch已经帮我们做好了随机初始化
 model = GPT(GPTConfig())
 print("ok")
+# 设置float32的运算精度
+'''
+“highest”:按完整fp32计算
+"high":如果存在可用的快速矩阵算法,则按tf32 or 将每个 f32视为两个bf16进行运算 否则和highest模式一致
+"medium":：若存在内部使用bf16的快速矩阵乘法算法,则使用bfloat16,不存在则按high进行计算
+剩余部分建议看文档
+'''
+# 而且即使运算速度最高提升了8倍,实际运算吞吐量从6000t/s ->8000t/s 主要原因还是受内存速率影响
+torch.set_float32_matmul_precision('high')
 model.to(device)
 # model.eval()
 
@@ -297,10 +307,12 @@ print(-math.log(p_token))
 # 不参与Adam中一二阶动量的计算
 
 # optim
+print(device)
 optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
 # 循环训练
 data = DataLoaderLite(B, T)
-for i in range(2640):
+for i in range(50):
+    t0=time.time()
     optim.zero_grad()
     x, y = data.next_batch()
     # 仅在读取时调用至GPU,减少显存消耗
@@ -309,6 +321,12 @@ for i in range(2640):
     print(f"step{i}", 'loss=', loss.item())
     loss.backward()
     optim.step()
+    # 阻塞cpu流,用于预估一次训练的耗时
+    # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
+    # 因此使用torch.cuda.synchronize()阻塞cpu流
+    torch.cuda.synchronize()
+    print(f'step{i} use time: {(time.time()-t0)}s')
+    print(f'{data.B * data.T / (time.time() - t0):.1f}token/s')
 
 # 下面是之前生成的代码,这里计算loss时忽略
 import sys;
