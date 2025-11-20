@@ -309,6 +309,7 @@ print(-math.log(p_token))
 # optim
 print(device)
 optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+scaler = torch.GradScaler()
 # 循环训练
 data = DataLoaderLite(B, T)
 for i in range(50):
@@ -317,10 +318,16 @@ for i in range(50):
     x, y = data.next_batch()
     # 仅在读取时调用至GPU,减少显存消耗
     x, y = x.to(device), y.to(device)
-    logits, loss = model(x, y)
+    # using amp to accelerate training
+    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+        logits, loss = model(x, y)
     print(f"step{i}", 'loss=', loss.item())
-    loss.backward()
-    optim.step()
+    # loss.backward()
+    scaler.scale(loss).backward()
+    # optim.step()
+    scaler.step(optim)
+    scaler.update()
+
     # 阻塞cpu流,用于预估一次训练的耗时
     # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
     # 因此使用torch.cuda.synchronize()阻塞cpu流
