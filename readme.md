@@ -112,3 +112,12 @@ vocab_size= 50257 15005.4token/s
 提升了约16%
 
 二进制转换 50257->1100010001010001,通过抹掉后面的0来进位,即50304->1100010010000000即所求
+
+weakness:
+
+1. embedding bring more GPU memory use
+2. some of token probility have to be drop
+
+### 手动操作optimizer
+
+通过Vit中的configure_optimizer方法,实现对不同layer使用不同的optimize,具体操作看git过程和注释

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from transformers.quantizers.quantizer_hqq import weight
 
 
 @dataclass
@@ -243,7 +244,33 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+    def configure_optimizer(self, weight_decay, lr, device):
+        # start with all the candidate parameters (that require grad)
+        param_dict = {n: p for n, p in self.named_parameters()} #取出所有参数
+        param_dict = {n: p for n, p in param_dict.items() if p.requires_grad} #要求梯度的参数
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params=[ p for n, p in param_dict.items() if p.dim()>=2] #only liner and embedding decay
+        no_decay_dict=[p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            # 一个list嵌套dict,从而实现对多组参数实现不同的优化方式
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_dict, "weight_decay": 0.0},
+        ]
+        # numel = number of elements 的缩写,元素个数
+        num_decay_params = sun(p.numel() for p in decay_params)
+        num_nodecay_params = sun(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        # fused version could run faster than the non-fused, so we'll default to it.
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
+        
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B, self.T = B, T
@@ -334,7 +361,10 @@ def get_lr(step):
     coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
     return min_lr+coeff*(max_lr-min_lr)
 
-optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
+# 在模型内部定义optimiser,从而实现更多自定义功能
+# optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
+optim=model.configure_optimizers(weight_decay=0.1,learning_rate=max_lr,device= device)
+
 scaler = torch.GradScaler()
 # 循环训练
 data = DataLoaderLite(B, T)
@@ -347,7 +377,6 @@ for i in range(50):
     # using amp to accelerate training
     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
         logits, loss = model(x, y)
-    print(f"step{i}", 'loss=', loss.item())
     # loss.backward()
 
     # import code;code.interact(local=locals()) #截断运行,可以用于调试
@@ -369,8 +398,8 @@ for i in range(50):
     # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
     # 因此使用torch.cuda.synchronize()阻塞cpu流
     torch.cuda.synchronize()
-    print(f'step{i} use time: {(time.time()-t0)}s')
-    print(f'{data.B * data.T / (time.time() - t0):.1f}token/s')
+    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}")
+
 
 # 下面是之前生成的代码,这里计算loss时忽略
 import sys;
