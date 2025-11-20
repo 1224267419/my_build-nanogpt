@@ -69,3 +69,7 @@ for epoch in epochs:
         scaler.update()
 ```
 
+amp中会使用fp16/32的模块见[链接](https://docs.pytorch.org/docs/stable/amp.html#cuda-ops-that-can-autocast-to-float16)
+一般而言,**乘法不易受精度影响**,而指数运算影响较大,具体看链接吧
+
+`import code;code.interact(local=locals())`使用这段代码可以截断运行并保存运行状态,然后打开一个ipython**解释器**，让你可以实时查看和操作当前作用域内的变量与函数。

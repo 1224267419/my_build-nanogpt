@@ -319,10 +319,12 @@ for i in range(50):
     # 仅在读取时调用至GPU,减少显存消耗
     x, y = x.to(device), y.to(device)
     # using amp to accelerate training
-    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
         logits, loss = model(x, y)
     print(f"step{i}", 'loss=', loss.item())
     # loss.backward()
+
+    # import code;code.interact(local=locals()) #截断运行,可以用于调试
     scaler.scale(loss).backward()
     # optim.step()
     scaler.step(optim)
