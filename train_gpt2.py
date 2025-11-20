@@ -88,7 +88,7 @@ class CrossSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
         v = v.view(B, T, self.n_head, self.n_embd // self.n_head).transpose(1, 2)  # (B,nh,T,ns)
 
-        
+
         # #att=q@kT /sqrt(dim_k)
         # #对于更高维度的张量，torch.matmul 执行的是批量矩阵乘法
         # att = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.n_embd // self.n_head)
@@ -317,7 +317,24 @@ print(-math.log(p_token))
 
 # optim
 print(device)
-optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# 调整训练超参数(来自gpt3论文
+max_lr=6e-4
+min_lr=max_lr*0.1
+warmup_steps=10
+max_step=50
+def get_lr(step):
+    if step < warmup_steps:
+        return max_lr * (step+1) / warmup_steps
+    if step>max_step:
+        return min_lr
+    # between,use cosine decay
+    decay_ratio=(step-warmup_steps)/(max_step-warmup_steps)
+    assert 0<decay_ratio<1
+    # cosine decay
+    coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
+    return min_lr+coeff*(max_lr-min_lr)
+
+optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
 scaler = torch.GradScaler()
 # 循环训练
 data = DataLoaderLite(B, T)
@@ -336,6 +353,15 @@ for i in range(50):
     # import code;code.interact(local=locals()) #截断运行,可以用于调试
     scaler.scale(loss).backward()
     # optim.step()
+    # 限制loss范数,避免梯度爆炸
+    norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+    lr=get_lr(i)
+    # determine and set the learning rate for this iteration
+    # 遍历优化器中的每一组参数，并为它们设置一个新的学习率,从而实现动态lr
+    # 也可以让模型的不同块具有不同的lr
+    for param_group in optim.param_groups:
+        param_group['lr']=lr
+
     scaler.step(optim)
     scaler.update()
 
