@@ -4,8 +4,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from transformers.quantizers.quantizer_hqq import weight
-
+import inspect
 
 @dataclass
 class GPTConfig:
@@ -264,9 +263,12 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         # fused version could run faster than the non-fused, so we'll default to it.
+        # use one instead of lots of kernel to optimize weights,so could get rid of a lot of overhead
+        # following is to check if the fused AdamW is available or not
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and 'cuda' in device
         print(f"using fused AdamW: {use_fused}")
+
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
@@ -350,20 +352,20 @@ min_lr=max_lr*0.1
 warmup_steps=10
 max_step=50
 def get_lr(step):
-    if step < warmup_steps:
+    if step <= warmup_steps:
         return max_lr * (step+1) / warmup_steps
     if step>max_step:
         return min_lr
     # between,use cosine decay
     decay_ratio=(step-warmup_steps)/(max_step-warmup_steps)
-    assert 0<decay_ratio<1
+    assert 0<=decay_ratio<=1
     # cosine decay
     coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
     return min_lr+coeff*(max_lr-min_lr)
 
 # 在模型内部定义optimiser,从而实现更多自定义功能
-# optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
-optim=model.configure_optimizers(weight_decay=0.1,learning_rate=max_lr,device= device)
+optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
+# optim=model.configure_optimizers(weight_decay=0.1,learning_rate=max_lr,device= device)
 
 scaler = torch.GradScaler()
 # 循环训练
@@ -398,7 +400,7 @@ for i in range(50):
     # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
     # 因此使用torch.cuda.synchronize()阻塞cpu流
     torch.cuda.synchronize()
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}s | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step {i:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {time.time()-t0:.2f}s | tok/sec: {B * T/(time.time()-t0):.2f}")
 
 
 # 下面是之前生成的代码,这里计算loss时忽略

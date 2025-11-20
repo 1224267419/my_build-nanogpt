@@ -121,3 +121,7 @@ weakness:
 ### 手动操作optimizer
 
 通过Vit中的configure_optimizer方法,实现对不同layer使用不同的optimize,具体操作看git过程和注释
+
+### 梯度累计gradient accumulate
+
+帮助你在low GRAM也能follow large batch_size
