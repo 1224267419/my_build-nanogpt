@@ -144,5 +144,7 @@ weakness:
   "cuda:0" 实际是物理卡 2
   "cuda:1" 实际是物理卡 3
 
+### dataset
 
+fineWeb-edu-sample-10BT ,using [fineweb.py](fineweb.py)  to download  or download on hugging face
 

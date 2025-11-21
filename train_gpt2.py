@@ -259,8 +259,9 @@ class GPT(nn.Module):
         # numel = number of elements 的缩写,元素个数
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        if master_process:
+            print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+            print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         # fused version could run faster than the non-fused, so we'll default to it.
         # use one instead of lots of kernel to optimize weights,so could get rid of a lot of overhead
@@ -269,6 +270,8 @@ class GPT(nn.Module):
         use_fused = fused_available and 'cuda' in device
         print(f"using fused AdamW: {use_fused}")
 
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
@@ -445,8 +448,10 @@ def get_lr(step):
     return min_lr+coeff*(max_lr-min_lr)
 
 # 在模型内部定义optimiser,从而实现更多自定义功能
-optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
+# optim = raw_model.configure_optimizer(lr=3e-4,betas=(0.9,0.95),eps=1e-8)
 # optim=model.configure_optimizers(weight_decay=0.1,learning_rate=max_lr,device= device)
+#  使用ddp_model进行前向和反向传播,优化时应优化原始模型
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, lr=6e-4, device=device)
 
 # 梯度裁剪
 scaler = torch.GradScaler()
@@ -454,7 +459,7 @@ scaler = torch.GradScaler()
 data = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size)
 for step in range(max_steps):
     t0 = time.time()
-    optim.zero_grad()
+    optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = data.next_batch()
@@ -486,10 +491,10 @@ for step in range(max_steps):
     # 遍历优化器中的每一组参数，并为它们设置一个新的学习率,从而实现动态lr
     # 也可以让模型的不同块具有不同的lr
     lr=get_lr(step)
-    for param_group in optim.param_groups:
+    for param_group in optimizer.param_groups:
         param_group['lr']=lr
 
-    scaler.step(optim)
+    scaler.step(optimizer)
     scaler.update()
     # 阻塞cpu流,用于预估一次训练的耗时
     # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
