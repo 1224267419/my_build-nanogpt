@@ -144,5 +144,13 @@ weakness:
   "cuda:0" 实际是物理卡 2
   "cuda:1" 实际是物理卡 3
 
+## dataset
 
+fineWeb-edu-sample-10BT ,using [fineweb.py](fineweb.py)  to download  or download on hugging face
 
+遇到443网络问题:
+
+1. 手动下载数据集到本地(下载失败也会创建目录结构)
+2. 手动调整文件读取路径`fw = load_dataset("./edu_fineweb10B", split="train") `
+
+多线程问题:windows下记得把多线程部分放在`if __name__ == "__main__":`内,否则会有调用异常,产生循环调用
