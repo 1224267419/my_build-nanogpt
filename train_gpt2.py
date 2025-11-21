@@ -462,26 +462,24 @@ for step in range(max_steps):
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             logits, loss = model(x, y)
     # using amp to accelerate training
-    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    # loss.backward()
-    loss = loss / grad_accum_steps
-    loss_accum += loss.detach()
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            # 这部分等价于with ddp.no_sync():, 但更简单
+            # ddp就是通过查看model.require_backward_grad_sync来确认是否需要同步梯度
+
+            # 配合梯度累积，在每个step中,只在最后一次 micro-step 同步梯度,节省通信开销
+            # 通信次数从grad_accum_steps次 → 减少为1次
+            # 但结果仍然等价于：所有micro - batch的梯度在各卡累加 + 最后一次同步
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        scaler.scale(loss).backward()
     if ddp:
-        # 配合梯度累积，在每个step中,只在最后一次 micro-step 同步梯度,节省通信开销
-        # 通信次数从grad_accum_steps次 → 减少为1次
-        # 但结果仍然等价于：所有micro - batch的梯度在各卡累加 + 最后一次同步
-        model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-    loss.backward()
-if ddp:
-    # 把各进程的 loss 做 all-reduce 取平均,仅用于log
-    # 梯度同步是 DDP 帮你在 backward 时做的，
-    # all_reduce(loss_accum) 只是为了日志统计，不影响训练结果。
-    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        # 把各进程的 loss 做 all-reduce 取平均,仅用于log
+        # 梯度同步是 DDP 帮你在 backward 时做的，
+        # all_reduce(loss_accum) 只是为了日志统计，不影响训练结果。
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     # import code;code.interact(local=locals()) #截断运行,可以用于调试
-    scaler.scale(loss).backward()
-    # optim.step()
     # 限制loss范数,避免梯度爆炸
     norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
     # determine and set the learning rate for this iteration
@@ -493,7 +491,6 @@ if ddp:
 
     scaler.step(optim)
     scaler.update()
-
     # 阻塞cpu流,用于预估一次训练的耗时
     # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
     # 因此使用torch.cuda.synchronize()阻塞cpu流
