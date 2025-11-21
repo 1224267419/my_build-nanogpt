@@ -125,3 +125,24 @@ weakness:
 ### 梯度累计gradient accumulate
 
 帮助你在low GRAM也能follow large batch_size
+
+方法:在train 循环中添加loss的累积循环直至累计batch=目标batch
+要求:loss默认使用mean方法,因此loss的每一次backwards前都要/grad_accum_steps
+
+## DistributeDataParallel 多显卡计算(数据并行)
+
+1. set GPU RANK (on ddp part)
+2. set batchsize `grad_accum_steps = total_batch_size // (B * T * ddp_world_size)` every batch become multy gpu process,
+3. if ddp:    destroy_process_group() 训练完成后要销毁
+4. dataloader:    make each process have different data
+5. `model = DDP(model, device_ids=[ddp_local_rank])`#把模型包成 DDP，让它在多进程多卡下自动做梯度同步。
+6. backward:			
+
+让程序只看到 2、3 两张实际显卡
+`CUDA_VISIBLE_DEVICES=2,3 python train.py`
+在程序中：
+  "cuda:0" 实际是物理卡 2
+  "cuda:1" 实际是物理卡 3
+
+
+

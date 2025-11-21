@@ -250,15 +250,15 @@ class GPT(nn.Module):
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params=[ p for n, p in param_dict.items() if p.dim()>=2] #only liner and embedding decay
-        no_decay_dict=[p for n, p in param_dict.items() if p.dim() < 2]
+        nodecay_params=[p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
             # 一个list嵌套dict,从而实现对多组参数实现不同的优化方式
             {"params": decay_params, "weight_decay": weight_decay},
-            {"params": no_decay_dict, "weight_decay": 0.0},
+            {"params": nodecay_params, "weight_decay": 0.0},
         ]
         # numel = number of elements 的缩写,元素个数
-        num_decay_params = sun(p.numel() for p in decay_params)
-        num_nodecay_params = sun(p.numel() for p in nodecay_params)
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
@@ -269,13 +269,14 @@ class GPT(nn.Module):
         use_fused = fused_available and 'cuda' in device
         print(f"using fused AdamW: {use_fused}")
 
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
         
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B, self.T = B, T
+        self.process_rank, self.num_processes = process_rank, num_processes
         import tiktoken
         enc = tiktoken.get_encoding("gpt2")
         with open('input.txt', 'r', encoding='utf-8') as f:
@@ -285,23 +286,96 @@ class DataLoaderLite:
         self.tokens = encoding.encode(text)
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
-        self.current_position = 0
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
+        # 分布式数据加载,确保每个进程只加载自己需要的数据且数据不重合
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
         tokens = self.tokens[self.current_position:self.current_position + B * T + 1]
         x = torch.tensor(tokens[:-1]).view(B, T)
         y = torch.tensor(tokens[1:]).view(B, T)
-        self.current_position += B * T
+        self.current_position += self.B * self.T * self.process_rank
         # 超界限则reset
-        if self.current_position + B * T >= len(self.tokens):
-            self.current_position = 0
+        if self.current_position +self.B * self.T * self.process_rank >= len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         # 按batch跳token
         return x, y
 
 
+# -----------------------------------------------------------------------------
+
+
 # Use a more general method
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs: #8个单独进程,8个gpu
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+
+# 让程序只看到 2、3 两张卡
+# CUDA_VISIBLE_DEVICES=2,3 python train.py
+# 程序中：
+#   "cuda:0" 实际是物理卡 2
+#   "cuda:1" 实际是物理卡 3
+
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import os
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # 初始化进程组，使当前进程加入分布式通信（如 NCCL、Gloo 等）
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+
+
+    # RANK 全局进程 ID（0~world_size-1
+    # LOCAL_RANK  当前节点（机器）内的 GPU ID
+    # WORLD_SIZE  总进程数（= 总 GPU 数）
+
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    # 仅cuda0为master process 用于输出日志等信息,其它卡仅train
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+B = 16 # micro batch size
+T = 1024 # sequence length
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+
 
 # data loading
 import tiktoken
@@ -312,6 +386,14 @@ with open('input.txt', 'r', encoding='utf-8') as f:
     # print(text[:1000])
 encoding = tiktoken.get_encoding('gpt2')
 token = encoding.encode(text[:1000])
+
+
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 B, T = 2, 1024  # using for debug
 # 初始化,用buf不断滑动窗口得到输入和输出来求loss
 
@@ -331,15 +413,14 @@ print("ok")
 '''
 # 而且即使运算速度最高提升了8倍,实际运算吞吐量从6000t/s ->8000t/s 主要原因还是受内存速率影响
 torch.set_float32_matmul_precision('high')
+
 model.to(device)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
 # model=torch.compile( model)
 # model.eval()
-
-# 随机初始化的loss=10.9650
-p_token = 1 / 50257
-# 交叉熵计算:-ln P
-print(-math.log(p_token))
-# 和随机预测的loss很接近
 
 # AdamW将优化过程中使用的针对网络权重的衰减项（或者叫正则项）从loss中单独拿了出来，
 # 不参与Adam中一二阶动量的计算
@@ -350,14 +431,14 @@ print(device)
 max_lr=6e-4
 min_lr=max_lr*0.1
 warmup_steps=10
-max_step=50
+max_steps=50
 def get_lr(step):
     if step <= warmup_steps:
         return max_lr * (step+1) / warmup_steps
-    if step>max_step:
+    if step>max_steps:
         return min_lr
     # between,use cosine decay
-    decay_ratio=(step-warmup_steps)/(max_step-warmup_steps)
+    decay_ratio=(step-warmup_steps)/(max_steps-warmup_steps)
     assert 0<=decay_ratio<=1
     # cosine decay
     coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))
@@ -367,29 +448,46 @@ def get_lr(step):
 optim = torch.optim.AdamW(model.parameters(), lr=3e-4,betas=(0.9,0.95),eps=1e-8)
 # optim=model.configure_optimizers(weight_decay=0.1,learning_rate=max_lr,device= device)
 
+# 梯度裁剪
 scaler = torch.GradScaler()
 # 循环训练
-data = DataLoaderLite(B, T)
-for i in range(50):
-    t0=time.time()
+data = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size)
+for step in range(max_steps):
+    t0 = time.time()
     optim.zero_grad()
-    x, y = data.next_batch()
-    # 仅在读取时调用至GPU,减少显存消耗
-    x, y = x.to(device), y.to(device)
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = data.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
     # using amp to accelerate training
     with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
         logits, loss = model(x, y)
     # loss.backward()
+    loss = loss / grad_accum_steps
+    loss_accum += loss.detach()
+    if ddp:
+        # 配合梯度累积，在每个step中,只在最后一次 micro-step 同步梯度,节省通信开销
+        # 通信次数从grad_accum_steps次 → 减少为1次
+        # 但结果仍然等价于：所有micro - batch的梯度在各卡累加 + 最后一次同步
+        model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+    loss.backward()
+if ddp:
+    # 把各进程的 loss 做 all-reduce 取平均,仅用于log
+    # 梯度同步是 DDP 帮你在 backward 时做的，
+    # all_reduce(loss_accum) 只是为了日志统计，不影响训练结果。
+    dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     # import code;code.interact(local=locals()) #截断运行,可以用于调试
     scaler.scale(loss).backward()
     # optim.step()
     # 限制loss范数,避免梯度爆炸
     norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
-    lr=get_lr(i)
     # determine and set the learning rate for this iteration
     # 遍历优化器中的每一组参数，并为它们设置一个新的学习率,从而实现动态lr
     # 也可以让模型的不同块具有不同的lr
+    lr=get_lr(step)
     for param_group in optim.param_groups:
         param_group['lr']=lr
 
@@ -400,14 +498,22 @@ for i in range(50):
     # 因为运行计算过后,哪怕gpu未完成计算,cpu也会继续运行后续代码
     # 因此使用torch.cuda.synchronize()阻塞cpu流
     torch.cuda.synchronize()
-    print(f"step {i:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {time.time()-t0:.2f}s | tok/sec: {B * T/(time.time()-t0):.2f}")
+    t1 = time.time()
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = data.B * data.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum:.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 # 下面是之前生成的代码,这里计算loss时忽略
-import sys;
+import sys;sys.exit(0)
 
-sys.exit(0)
-
+# 随机初始化的loss=10.9650
+p_token = 1 / 50257
+# 交叉熵计算:-ln P
+print(-math.log(p_token))
+# 和随机预测的loss很接近
 # tokenizer encode
 import tiktoken
 
@@ -442,7 +548,7 @@ while x.size(1) < max_length:
         # 将新的词拼接在原来的输入x后面
         x = torch.cat((x, xcol), dim=1)
 # 输出解码结果
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
+for step in range(num_return_sequences):
+    tokens = x[step, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
