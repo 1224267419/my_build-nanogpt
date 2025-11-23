@@ -164,3 +164,14 @@ step  114 | loss: 7.440380 | lr 9.6503e-05 | norm: 89621.7109 | dt: 50634.60ms |
 
 性能问题,5000step跑不完,就到此为止了
 
+11-23
+
+增加了val部分的代码,包括val_loss & val model output
+
+### val data2  HellaSwag 
+
+![image-20251123171010874](./readme.assets/image-20251123171010874.png)
+
+using batch_size=4的input,lenth为最长的input,其余做padding.其他模型可能可以context+option 一次性输入,但是gpt2因为size问题做不到,因此只能一次次input然后计算score
+
+在这个任务中，模型不需要直接输出分类标签（0, 1, 2, 3），而是计算：**“给定这个上下文，接下去写出这四个选项的概率分别是多少？”**
