@@ -154,3 +154,13 @@ fineWeb-edu-sample-10BT ,using [fineweb.py](fineweb.py)  to download  or downloa
 2. 手动调整文件读取路径`fw = load_dataset("./edu_fineweb10B", split="train") `
 
 多线程问题:windows下记得把多线程部分放在`if __name__ == "__main__":`内,否则会有调用异常,产生循环调用
+
+##### loss
+
+step  111 | loss: 7.572558 | lr 9.3986e-05 | norm: 91179.6406 | dt: 50265.78ms | tok/sec: 20860.63
+step  112 | loss: 7.528384 | lr 9.4825e-05 | norm: 90551.3672 | dt: 50270.84ms | tok/sec: 20858.53
+step  113 | loss: 7.484374 | lr 9.5664e-05 | norm: 90010.0078 | dt: 50610.49ms | tok/sec: 20718.55
+step  114 | loss: 7.440380 | lr 9.6503e-05 | norm: 89621.7109 | dt: 50634.60ms | tok/sec: 20708.69
+
+性能问题,5000step跑不完,就到此为止了
+

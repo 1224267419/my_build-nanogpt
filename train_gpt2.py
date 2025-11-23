@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import inspect
-
+import numpy as np
 @dataclass
 class GPTConfig:
     block_size: int = 1024  # max sequence length
@@ -276,7 +276,7 @@ class GPT(nn.Module):
         return optimizer
 
         
-class DataLoaderLite:
+class DataLoaderLite0:
     def __init__(self, B, T, process_rank, num_processes):
         self.B, self.T = B, T
         self.process_rank, self.num_processes = process_rank, num_processes
@@ -304,6 +304,48 @@ class DataLoaderLite:
         if self.current_position +self.B * self.T * self.process_rank >= len(self.tokens):
             self.current_position = self.B * self.T * self.process_rank
         # 按batch跳token
+        return x, y
+
+class DataLoaderLite1:
+    def __init__(self, B, T, process_rank, num_processes,split):
+        def load_tokens(filename):
+            npt = np.load(filename)
+            ptt = torch.tensor(npt, dtype=torch.long)
+            return ptt
+        self.B, self.T = B, T
+        self.process_rank, self.num_processes = process_rank, num_processes
+        assert split in ['train', 'val']
+        import tiktoken
+        enc = tiktoken.get_encoding("gpt2")
+
+        # get shard data
+        data_root="./edu_fineweb10B"
+        shards=os.listdir(data_root)
+        # 数据分为 tarin 和 val 两个部分,取出想要的部分
+        shards=[s for s in shards if split in s]
+        shards=sorted(shards)
+        shards=[os.path.join(data_root,s) for s in shards]
+        self.shards=shards
+        assert len(shards)>0 ,f"no shards found for split{split}"
+        if master_process:
+            print(f"1 epoch = {len(shards) } shards for split {split}")
+
+        self.current_shard=0
+        self.tokens=load_tokens(self.shards[self.current_shard])
+        # 一样,多设备分配数据
+        self.current_position=self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        tokens = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x = torch.tensor(tokens[:-1]).view(B, T)
+        y = torch.tensor(tokens[1:]).view(B, T)
+        self.current_position += self.B * self.T * self.process_rank
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x, y
 
 
@@ -370,7 +412,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size
+B = 1 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -401,8 +443,7 @@ B, T = 2, 1024  # using for debug
 # 初始化,用buf不断滑动窗口得到输入和输出来求loss
 
 
-num_return_sequences = 5
-max_length = 30
+
 # model = GPT.from_pretrained('gpt2')
 # torch已经帮我们做好了随机初始化
 model = GPT(GPTConfig())
@@ -433,8 +474,10 @@ print(device)
 # 调整训练超参数(来自gpt3论文
 max_lr=6e-4
 min_lr=max_lr*0.1
-warmup_steps=10
-max_steps=50
+# 以下step来自gpt3原文
+warmup_steps=715 #375e6//(2**19)
+max_steps=19703 #10e9//(2**19)
+
 def get_lr(step):
     if step <= warmup_steps:
         return max_lr * (step+1) / warmup_steps
@@ -451,12 +494,14 @@ def get_lr(step):
 # optim = raw_model.configure_optimizer(lr=3e-4,betas=(0.9,0.95),eps=1e-8)
 # optim=model.configure_optimizers(weight_decay=0.1,learning_rate=max_lr,device= device)
 #  使用ddp_model进行前向和反向传播,优化时应优化原始模型
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, lr=6e-4, device=device)
+optimizer = raw_model.configure_optimizer(weight_decay=0.1, lr=6e-4, device=device)
 
 # 梯度裁剪
 scaler = torch.GradScaler()
 # 循环训练
-data = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size)
+# data = DataLoaderLite0(B, T, process_rank=ddp_rank, num_processes=ddp_world_size)
+data = DataLoaderLite1(B, T, process_rank=ddp_rank, num_processes=ddp_world_size,split="train")
+
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
