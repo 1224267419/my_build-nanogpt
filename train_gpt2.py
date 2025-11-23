@@ -1,3 +1,5 @@
+#TODO fix device and device_type
+
 import math
 import time
 from dataclasses import dataclass
@@ -64,6 +66,7 @@ class CrossSelfAttention(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+
 
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         # 它的核心作用是创建一个 “看不见未来” 的挡板，专业上称为因果掩码（Causal Mask）
@@ -309,6 +312,7 @@ class DataLoaderLite1:
     def __init__(self, B, T, process_rank, num_processes, split):
         def load_tokens(filename):
             npt = np.load(filename)
+            npt = npt.astype(np.int32)
             ptt = torch.tensor(npt, dtype=torch.long)
             return ptt
 

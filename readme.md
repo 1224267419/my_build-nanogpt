@@ -175,3 +175,11 @@ step  114 | loss: 7.440380 | lr 9.6503e-05 | norm: 89621.7109 | dt: 50634.60ms |
 using batch_size=4的input,lenth为最长的input,其余做padding.其他模型可能可以context+option 一次性输入,但是gpt2因为size问题做不到,因此只能一次次input然后计算score
 
 在这个任务中，模型不需要直接输出分类标签（0, 1, 2, 3），而是计算：**“给定这个上下文，接下去写出这四个选项的概率分别是多少？”**
+
+
+
+
+
+### sft
+
+fine-tuning 使得模型更加适合目标任务,实际上只是更换了dataset,其他方法和上述步骤并没有什么不同
