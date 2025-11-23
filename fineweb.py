@@ -2,31 +2,14 @@ import os
 import multiprocessing as mp
 import numpy as np
 import tiktoken
-from datasets import load_dataset 
-from tqdm import tqdm 
-
 # ------------------------------------------
-# 配置部分
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e8) # 100M tokens per shard
 
-# ------------------------------------------
-# 全局变量与函数
-# 注意：在 Windows 下，子进程会重新运行这部分代码。
-# tiktoken 的初始化速度很快，保留在全局是可接受的。
-# 如果放在 main 里面，子进程因为看不到 enc 变量会报错。
 
-try:
     enc = tiktoken.get_encoding("gpt2")
-    eot = enc._special_tokens['<|endoftext|>'] 
-except Exception as e:
-    print(f"Tokenizer init failed: {e}")
-
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
-    # 确保在这个函数里使用的变量（如 enc, eot）在子进程的全局作用域里是存在的
-    tokens = [eot] 
     tokens.extend(enc.encode_ordinary(doc["text"]))
     tokens_np = np.array(tokens)
     assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
@@ -90,4 +73,3 @@ if __name__ == "__main__":
             filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
             write_datafile(filename, all_tokens_np[:token_count])
     
-    print("Done.")
